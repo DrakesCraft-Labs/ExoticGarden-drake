@@ -42,10 +42,9 @@ import io.github.thebusybiscuit.exoticgarden.items.BonemealableItem;
 import io.github.thebusybiscuit.slimefun4.api.items.SlimefunItem;
 import io.github.thebusybiscuit.slimefun4.implementation.Slimefun;
 import dev.drake.dough.config.Config;
-import dev.drake.dough.protection.Interaction;
+import io.github.thebusybiscuit.slimefun4.libraries.dough.protection.Interaction;
 import dev.drake.dough.skins.PlayerHead;
 import dev.drake.dough.skins.PlayerSkin;
-import io.github.thebusybiscuit.slimefun4.libraries.paperlib.PaperLib;
 import me.mrCookieSlime.Slimefun.api.BlockStorage;
 
 public class PlantsListener implements Listener {
@@ -62,20 +61,10 @@ public class PlantsListener implements Listener {
 
     @EventHandler
     public void onGrow(StructureGrowEvent e) {
-        if (PaperLib.isPaper()) {
-            if (PaperLib.isChunkGenerated(e.getLocation())) {
-                growStructure(e);
-            }
-            else {
-                PaperLib.getChunkAtAsync(e.getLocation()).thenRun(() -> growStructure(e));
-            }
+        if (!e.getLocation().getChunk().isLoaded()) {
+            e.getLocation().getChunk().load();
         }
-        else {
-            if (!e.getLocation().getChunk().isLoaded()) {
-                e.getLocation().getChunk().load();
-            }
-            growStructure(e);
-        }
+        growStructure(e);
     }
 
     @EventHandler
@@ -106,17 +95,7 @@ public class PlantsListener implements Listener {
                 int z = chunkZ * 16 + random.nextInt(16);
 
                 if ((x < worldLimit && x > -worldLimit) && (z < worldLimit && z > -worldLimit)) {
-                    if (PaperLib.isPaper()) {
-                        if (PaperLib.isChunkGenerated(world, chunkX, chunkZ)) {
-                            growBush(e, x, z, berry, random, true);
-                        }
-                        else {
-                            PaperLib.getChunkAtAsync(world, chunkX, chunkZ).thenRun(() -> growBush(e, x, z, berry, random, true));
-                        }
-                    }
-                    else {
-                        growBush(e, x, z, berry, random, false);
-                    }
+                    growBush(e, x, z, berry, random, true);
                 }
             }
             else if (random.nextInt(100) < cfg.getInt("chances.TREE")) {
@@ -129,17 +108,7 @@ public class PlantsListener implements Listener {
                 int z = chunkZ * 16 + random.nextInt(16);
 
                 if ((x < worldLimit && x > -worldLimit) && (z < worldLimit && z > -worldLimit)) {
-                    if (PaperLib.isPaper()) {
-                        if (PaperLib.isChunkGenerated(world, chunkX, chunkZ)) {
-                            pasteTree(e, x, z, tree);
-                        }
-                        else {
-                            PaperLib.getChunkAtAsync(world, chunkX, chunkZ).thenRun(() -> pasteTree(e, x, z, tree));
-                        }
-                    }
-                    else {
-                        plugin.getServer().getScheduler().scheduleSyncDelayedTask(plugin, () -> pasteTree(e, x, z, tree));
-                    }
+                    pasteTree(e, x, z, tree);
                 }
             }
         }
