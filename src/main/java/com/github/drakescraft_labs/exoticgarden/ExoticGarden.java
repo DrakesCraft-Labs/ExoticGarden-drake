@@ -373,125 +373,138 @@ public class ExoticGarden extends JavaPlugin implements SlimefunAddon {
         magicalEssence.register(this);
     }
 
+    /**
+     * Un cultivo maduro ocupa DOS bloques: la base (hojas, conserva el id del
+     * brote) y la cabeza (PLAYER_HEAD, guarda el id de la baya con la esencia).
+     */
+    private static final class PlantTarget {
+        final Berry berry;
+        final Block base;
+        final Block head;   // null si todavia no ha madurado
+
+        PlantTarget(Berry berry, Block base, Block head) {
+            this.berry = berry;
+            this.base = base;
+            this.head = head;
+        }
+    }
+
+    /** Lee el id de Slimefun de un bloque tolerando fallos de timing de BlockStorage. */
+    @Nullable
+    private static String readPlantId(@Nonnull Block block) {
+        SlimefunItem item = BlockStorage.check(block);
+        if (item != null) {
+            return item.getId();
+        }
+        return BlockStorage.checkID(block);
+    }
+
+    /**
+     * Resuelve el cultivo a partir de CUALQUIERA de sus dos bloques.
+     *
+     * Antes solo se comparaba contra {@code berry.getID()}, el id que vive en la
+     * cabeza. La base conserva {@code berry.toBush()}, asi que un clic derecho en
+     * las hojas --que son el bloque grande y visible, el que el jugador pulsa de
+     * forma natural-- no casaba con ninguna baya y la cosecha devolvia null sin
+     * hacer nada. De ahi el "solo me dio esencia una vez": solo funcionaba cuando
+     * el jugador acertaba a pulsar la cabeza.
+     */
+    @Nullable
+    private static PlantTarget resolvePlant(@Nonnull Block clicked) {
+        Block[] candidatos = { clicked, clicked.getRelative(BlockFace.UP), clicked.getRelative(BlockFace.DOWN) };
+        for (Block candidato : candidatos) {
+            String id = readPlantId(candidato);
+            if (id == null) {
+                continue;
+            }
+            for (Berry berry : getBerries()) {
+                if (id.equalsIgnoreCase(berry.getID())) {
+                    // El candidato es la cabeza con la esencia.
+                    return new PlantTarget(berry, candidato.getRelative(BlockFace.DOWN), candidato);
+                }
+                if (id.equalsIgnoreCase(berry.toBush())) {
+                    // El candidato es la base. La cabeza solo cuenta si de verdad
+                    // lleva la esencia: si no, la planta aun no ha madurado.
+                    Block arriba = candidato.getRelative(BlockFace.UP);
+                    String idArriba = readPlantId(arriba);
+                    boolean madura = idArriba != null && idArriba.equalsIgnoreCase(berry.getID());
+                    return new PlantTarget(berry, candidato, madura ? arriba : null);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Deja el bloque como brote registrado. Es el unico camino de vuelta al
+     * estado plantable: si BlockStorage no queda escrito, el siguiente
+     * StructureGrowEvent no reconoce el bloque y crece un roble vanilla.
+     */
+    private static void restoreSapling(@Nonnull Block base, @Nonnull ItemStack bushStack) {
+        BlockStorage.deleteLocationInfoUnsafely(base.getLocation(), false);
+        base.setType(Material.OAK_SAPLING);
+        BlockStorage.deleteLocationInfoUnsafely(base.getLocation(), false);
+        BlockStorage.store(base, bushStack);
+        if (BlockStorage.check(base) == null) {
+            // Carrera con la escritura asincrona de BlockStorage: se reintenta.
+            ItemStack copia = bushStack.clone();
+            ExoticGarden.getInstance().getServer().getScheduler().runTask(ExoticGarden.getInstance(), () -> {
+                BlockStorage.deleteLocationInfoUnsafely(base.getLocation(), false);
+                base.setType(Material.OAK_SAPLING);
+                BlockStorage.store(base, copia);
+            });
+        }
+    }
+
     @Nullable
     public static ItemStack harvestPlant(@Nonnull Block block) {
         /*
-         * Contrato de cosecha: devuelve el fruto y deja el bloque base como brote
-         * registrado en BlockStorage. Las plantas maduras pueden guardar su ID en
-         * la cabeza aunque el jugador pulse las hojas; por eso se normaliza el
-         * bloque antes de modificar el mundo. No eliminar esta normalización: sin
-         * ella se limpia/restaura el bloque equivocado y el cultivo se convierte
-         * en una planta vanilla o se pierde al siguiente reinicio.
+         * Contrato de cosecha: devuelve el fruto y deja SIEMPRE la base como brote
+         * registrado en BlockStorage, de modo que el cultivo vuelva a crecer. Si no
+         * se puede cumplir el contrato completo no se devuelve fruto y no se toca
+         * el mundo: entregar sin consumir es una fuente de duplicados.
          */
-        SlimefunItem item = BlockStorage.check(block);
-        // Fallback robusto si check falla por timing (ensenar el id directo)
-        if (item == null) {
-            String id = BlockStorage.checkID(block);
-            if (id != null) item = SlimefunItem.getById(id);
+        PlantTarget target = resolvePlant(block);
+        if (target == null) {
+            return null;
         }
-        // Si sigue sin item, probar bloque adyacente (cosecha desde hoja vs cabeza)
-        Block adjacent = null;
-        if (item == null) {
-            Material t = block.getType();
-            if (Tag.LEAVES.isTagged(t)) {
-                adjacent = block.getRelative(BlockFace.UP);
-            } else if (t == Material.PLAYER_HEAD || t == Material.PLAYER_WALL_HEAD) {
-                adjacent = block.getRelative(BlockFace.DOWN);
-            } else if (t == Material.OAK_SAPLING) {
-                // brote sin crecer, no debería cosechar, pero por si acaso
-                adjacent = block.getRelative(BlockFace.UP);
-            }
-            if (adjacent != null && adjacent.getType() != Material.AIR) {
-                SlimefunItem adjItem = BlockStorage.check(adjacent);
-                if (adjItem == null) {
-                    String adjId = BlockStorage.checkID(adjacent);
-                    if (adjId != null) adjItem = SlimefunItem.getById(adjId);
-                }
-                if (adjItem != null) {
-                    // Para ORE_PLANT/DOUBLE_PLANT la info puede estar en el otro bloque de los 2
-                    for (Berry b : getBerries()) {
-                        if (adjItem.getId().equalsIgnoreCase(b.getID()) && (b.getType() == PlantType.ORE_PLANT || b.getType() == PlantType.DOUBLE_PLANT)) {
-                            item = adjItem;
-                            // Si se hizo clic en las hojas sin datos, cosechamos desde la cabeza.
-                            // Asi el switch de ORE_PLANT limpia la cabeza y restaura el brote base.
-                            if (Tag.LEAVES.isTagged(block.getType())) {
-                                block = adjacent;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if (item == null) {
+        Berry berry = target.berry;
+
+        SlimefunItem bushItem = SlimefunItem.getById(berry.toBush());
+        ItemStack bushStack = bushItem != null ? bushItem.getItem() : getItem(berry.toBush());
+        if (bushStack == null) {
+            /*
+             * Antes se devolvia el fruto y se dejaba el bloque intacto. Como la
+             * cabeza conservaba la esencia, cada clic volvia a entregar fruta:
+             * duplicacion infinita. Ahora no se entrega nada.
+             */
+            ExoticGarden.getInstance().getLogger().severe("[ExoticGarden] No se encontro brote para "
+                + berry.getID() + " -> " + berry.toBush()
+                + "; no se cosecha para no duplicar. Revisa el registro del addon.");
             return null;
         }
 
-        for (Berry berry : getBerries()) {
-            if (item.getId().equalsIgnoreCase(berry.getID())) {
-                // Resolver el item brote de forma robusta (evita NPE que deja vanilla)
-                SlimefunItem bushItem = SlimefunItem.getById(berry.toBush());
-                ItemStack bushStack = bushItem != null ? bushItem.getItem() : getItem(berry.toBush());
-                if (bushStack == null) {
-                    ExoticGarden.getInstance().getLogger().warning("[ExoticGarden] No se encontró brote para " + berry.getID() + " -> " + berry.toBush() + " - se deja como vanilla, revisa registro");
-                    return berry.getItem().clone();
+        switch (berry.getType()) {
+            case ORE_PLANT:
+            case DOUBLE_PLANT: {
+                if (target.head == null) {
+                    // Brote plantado pero aun sin esencia: no hay nada que cosechar
+                    // y destruirlo perderia el cultivo del jugador.
+                    return null;
                 }
-
-                switch (berry.getType()) {
-                    case ORE_PLANT:
-                    case DOUBLE_PLANT:
-                        Block plant = block;
-
-                        if (Tag.LEAVES.isTagged(block.getType())) {
-                            block = block.getRelative(BlockFace.UP);
-                        } else {
-                            plant = block.getRelative(BlockFace.DOWN);
-                        }
-
-                        // Limpiar arriba primero, luego abajo, y asegurar store después de setType
-                        BlockStorage.deleteLocationInfoUnsafely(block.getLocation(), false);
-                        block.getWorld().playEffect(block.getLocation(), Effect.STEP_SOUND, Material.OAK_LEAVES);
-                        block.setType(Material.AIR);
-                        // Asegurar que no quede info fantasma arriba
-                        BlockStorage.deleteLocationInfoUnsafely(block.getLocation(), false);
-
-                        // Resetear planta base a brote OAK_SAPLING con BlockStorage correcto
-                        BlockStorage.deleteLocationInfoUnsafely(plant.getLocation(), false);
-                        plant.setType(Material.OAK_SAPLING);
-                        // Doble limpieza para evitar race con BlockStorage async
-                        BlockStorage.deleteLocationInfoUnsafely(plant.getLocation(), false);
-                        BlockStorage.store(plant, bushStack);
-                        // Verificación defensiva: si BlockStorage no quedó, reintentar en siguiente tick
-                        if (BlockStorage.check(plant) == null) {
-                            Block finalPlant = plant;
-                            ItemStack finalBush = bushStack.clone();
-                            ExoticGarden.getInstance().getServer().getScheduler().runTask(ExoticGarden.getInstance(), () -> {
-                                BlockStorage.deleteLocationInfoUnsafely(finalPlant.getLocation(), false);
-                                finalPlant.setType(Material.OAK_SAPLING);
-                                BlockStorage.store(finalPlant, finalBush);
-                            });
-                        }
-                        return berry.getItem().clone();
-                    default:
-                        BlockStorage.deleteLocationInfoUnsafely(block.getLocation(), false);
-                        block.setType(Material.OAK_SAPLING);
-                        BlockStorage.deleteLocationInfoUnsafely(block.getLocation(), false);
-                        BlockStorage.store(block, bushStack);
-                        if (BlockStorage.check(block) == null) {
-                            Block finalBlock = block;
-                            ItemStack finalBush2 = bushStack.clone();
-                            ExoticGarden.getInstance().getServer().getScheduler().runTask(ExoticGarden.getInstance(), () -> {
-                                BlockStorage.deleteLocationInfoUnsafely(finalBlock.getLocation(), false);
-                                finalBlock.setType(Material.OAK_SAPLING);
-                                BlockStorage.store(finalBlock, finalBush2);
-                            });
-                        }
-                        return berry.getItem().clone();
-                }
+                BlockStorage.deleteLocationInfoUnsafely(target.head.getLocation(), false);
+                target.head.getWorld().playEffect(target.head.getLocation(), Effect.STEP_SOUND, Material.OAK_LEAVES);
+                target.head.setType(Material.AIR);
+                BlockStorage.deleteLocationInfoUnsafely(target.head.getLocation(), false);
+                restoreSapling(target.base, bushStack);
+                return berry.getItem().clone();
+            }
+            default: {
+                Block cuerpo = target.head != null ? target.head : target.base;
+                restoreSapling(cuerpo, bushStack);
+                return berry.getItem().clone();
             }
         }
-
-        return null;
     }
 
     public void harvestFruit(Block fruit) {
