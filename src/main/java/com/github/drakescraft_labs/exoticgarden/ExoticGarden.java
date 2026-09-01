@@ -403,12 +403,34 @@ public class ExoticGarden extends JavaPlugin implements SlimefunAddon {
      * Resuelve el cultivo a partir de CUALQUIERA de sus dos bloques.
      *
      * Antes solo se comparaba contra {@code berry.getID()}, el id que vive en la
-     * cabeza. La base conserva {@code berry.toBush()}, asi que un clic derecho en
+     * cabeza. La base conserva {@code berry.toBush()} mientras es brote y, una vez
+     * crecida, {@code growStructure} le reescribe la esencia; asi que un clic derecho en
      * las hojas --que son el bloque grande y visible, el que el jugador pulsa de
      * forma natural-- no casaba con ninguna baya y la cosecha devolvia null sin
      * hacer nada. De ahi el "solo me dio esencia una vez": solo funcionaba cuando
      * el jugador acertaba a pulsar la cabeza.
      */
+    /**
+     * Los cultivos de dos bloques ocupan base (hojas) y cabeza (PLAYER_HEAD) y
+     * guardan la esencia en ambos, asi que hay que desambiguar por posicion.
+     */
+    static boolean esDeDosBloques(@Nonnull Berry berry) {
+        return berry.getType() == PlantType.ORE_PLANT || berry.getType() == PlantType.DOUBLE_PLANT;
+    }
+
+    /**
+     * Un bloque con la esencia es la BASE del cultivo (no la cabeza) cuando el
+     * bloque contiguo tambien pertenece al cultivo. Se aisla como funcion pura
+     * porque es la decision que se equivocaba y excavaba el suelo del jugador.
+     */
+    static boolean esBaseDeCultivo(@Nonnull String idEsencia, @Nullable String idVecino) {
+        return idEsencia.equalsIgnoreCase(idVecino);
+    }
+
+    static boolean esBaseDeCultivo(@Nonnull String idEsencia, @Nonnull String idBrote, @Nullable String idVecino) {
+        return idEsencia.equalsIgnoreCase(idVecino) || idBrote.equalsIgnoreCase(idVecino);
+    }
+
     @Nullable
     private static PlantTarget resolvePlant(@Nonnull Block clicked) {
         Block[] candidatos = { clicked, clicked.getRelative(BlockFace.UP), clicked.getRelative(BlockFace.DOWN) };
@@ -419,6 +441,25 @@ public class ExoticGarden extends JavaPlugin implements SlimefunAddon {
             }
             for (Berry berry : getBerries()) {
                 if (id.equalsIgnoreCase(berry.getID())) {
+                    if (esDeDosBloques(berry)) {
+                        // growStructure escribe la esencia en LOS DOS bloques del cultivo:
+                        // en la cabeza y, en la cola comun, tambien en la base de hojas.
+                        // Asumir que todo bloque con la esencia es la cabeza convertia el
+                        // suelo del jugador en brote y dejaba la cabeza real huerfana e
+                        // irrompible tras unas pocas cosechas.
+                        Block arriba = candidato.getRelative(BlockFace.UP);
+                        if (esBaseDeCultivo(berry.getID(), readPlantId(arriba))) {
+                            // Hay esencia encima: el candidato es la base, no la cabeza.
+                            return new PlantTarget(berry, candidato, arriba);
+                        }
+                        Block abajo = candidato.getRelative(BlockFace.DOWN);
+                        if (esBaseDeCultivo(berry.getID(), berry.toBush(), readPlantId(abajo))) {
+                            return new PlantTarget(berry, abajo, candidato);
+                        }
+                        // Cabeza sin base registrada (cultivo huerfano): se restaura sobre
+                        // si misma en vez de destruir el bloque que tenga debajo.
+                        return new PlantTarget(berry, candidato, candidato);
+                    }
                     // El candidato es la cabeza con la esencia.
                     return new PlantTarget(berry, candidato.getRelative(BlockFace.DOWN), candidato);
                 }
@@ -440,6 +481,26 @@ public class ExoticGarden extends JavaPlugin implements SlimefunAddon {
      * estado plantable: si BlockStorage no queda escrito, el siguiente
      * StructureGrowEvent no reconoce el bloque y crece un roble vanilla.
      */
+    /**
+     * El brote nunca debe sustituir el suelo sobre el que crece el cultivo. Si la
+     * base resuelta es tierra o hierba la resolucion fue erronea y se aborta la
+     * cosecha en vez de excavar la parcela del jugador.
+     */
+    static boolean puedeRestaurarBrote(@Nonnull Block base) {
+        switch (base.getType()) {
+            case GRASS_BLOCK:
+            case DIRT:
+            case COARSE_DIRT:
+            case ROOTED_DIRT:
+            case PODZOL:
+            case MYCELIUM:
+            case FARMLAND:
+                return false;
+            default:
+                return true;
+        }
+    }
+
     private static void restoreSapling(@Nonnull Block base, @Nonnull ItemStack bushStack) {
         BlockStorage.deleteLocationInfoUnsafely(base.getLocation(), false);
         base.setType(Material.OAK_SAPLING);
@@ -490,6 +551,11 @@ public class ExoticGarden extends JavaPlugin implements SlimefunAddon {
                 if (target.head == null) {
                     // Brote plantado pero aun sin esencia: no hay nada que cosechar
                     // y destruirlo perderia el cultivo del jugador.
+                    return null;
+                }
+                if (!puedeRestaurarBrote(target.base)) {
+                    // Se comprueba ANTES de tocar la cabeza: abortar a medias dejaria
+                    // el cultivo destruido y sin brote al que volver.
                     return null;
                 }
                 BlockStorage.deleteLocationInfoUnsafely(target.head.getLocation(), false);
