@@ -107,6 +107,20 @@ public class Schematic {
     }
 
     public static void pasteSchematic(Location loc, Tree tree) {
+        pasteSchematic(loc, tree, null);
+    }
+
+    /**
+     * Pega la plantilla del arbol en el mundo.
+     *
+     * @param loc        centro de la plantilla
+     * @param tree       arbol cuya plantilla se pega
+     * @param restrictTo si no es {@code null}, se omite todo bloque que caiga fuera de ese chunk.
+     *                   Se usa durante {@code ChunkPopulateEvent}: tocar un chunk vecino que aun no
+     *                   esta cargado fuerza {@code ServerChunkCache.syncLoad} en el hilo principal
+     *                   y dispara el watchdog de 10 s.
+     */
+    public static void pasteSchematic(Location loc, Tree tree, org.bukkit.Chunk restrictTo) {
         Schematic schematic;
 
         try {
@@ -133,6 +147,11 @@ public class Schematic {
                     int blockX = x + loc.getBlockX() - length / 2;
                     int blockY = y + loc.getBlockY();
                     int blockZ = z + loc.getBlockZ() - width / 2;
+
+                    if (restrictTo != null && ((blockX >> 4) != restrictTo.getX() || (blockZ >> 4) != restrictTo.getZ())) {
+                        continue;
+                    }
+
                     Block block = new Location(loc.getWorld(), blockX, blockY, blockZ).getBlock();
                     Material blockType = block.getType();
                     

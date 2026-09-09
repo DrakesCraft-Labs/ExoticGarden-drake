@@ -1,10 +1,12 @@
 package com.github.drakescraft_labs.exoticgarden.listeners;
 
+import java.io.IOException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.logging.Level;
 
 import org.bukkit.Effect;
 import org.bukkit.GameMode;
@@ -34,6 +36,7 @@ import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 
 import com.github.drakescraft_labs.exoticgarden.Berry;
+import com.github.drakescraft_labs.exoticgarden.ChunkFootprint;
 import com.github.drakescraft_labs.exoticgarden.ExoticGarden;
 import com.github.drakescraft_labs.exoticgarden.PlantType;
 import com.github.drakescraft_labs.exoticgarden.Tree;
@@ -50,6 +53,9 @@ import com.github.drakescraft_labs.slimefun4.legacy.api.BlockStorage;
 import io.papermc.lib.PaperLib;
 
 public class PlantsListener implements Listener {
+
+    /** Lado del barrido cuadrado de isFlat, en bloques. */
+    private static final int FLAT_SCAN_SIZE = 5;
 
     private final Config cfg;
     private final ExoticGarden plugin;
@@ -159,11 +165,18 @@ public class PlantsListener implements Listener {
                 int chunkX = e.getChunk().getX();
                 int chunkZ = e.getChunk().getZ();
 
-                int x = chunkX * 16 + random.nextInt(16);
-                int z = chunkZ * 16 + random.nextInt(16);
+                // El candidato se acota para que ni el barrido de isFlat ni la huella de la
+                // plantilla salgan del chunk que se esta poblando: leer un vecino sin cargar
+                // fuerza ServerChunkCache.syncLoad en el hilo principal (watchdog de 10 s).
+                int[] range = getSafeTreeOffsetRange(tree);
 
-                if ((x < worldLimit && x > -worldLimit) && (z < worldLimit && z > -worldLimit)) {
-                    pasteTree(e, x, z, tree);
+                if (range != null) {
+                    int x = chunkX * 16 + range[0] + random.nextInt(range[1] - range[0] + 1);
+                    int z = chunkZ * 16 + range[0] + random.nextInt(range[1] - range[0] + 1);
+
+                    if ((x < worldLimit && x > -worldLimit) && (z < worldLimit && z > -worldLimit)) {
+                        pasteTree(e, x, z, tree);
+                    }
                 }
             }
         }
@@ -258,13 +271,38 @@ public class PlantsListener implements Listener {
     }
 
     private void pasteTree(ChunkPopulateEvent e, int x, int z, Tree tree) {
+        int chunkX = e.getChunk().getX();
+        int chunkZ = e.getChunk().getZ();
+
         for (int y = e.getWorld().getMaxHeight(); y > 30; y--) {
             Block current = e.getWorld().getBlockAt(x, y, z);
-            if (!current.getType().isSolid() && current.getType() != Material.WATER && current.getType() != Material.SEAGRASS && current.getType() != Material.TALL_SEAGRASS && !(current.getBlockData() instanceof Waterlogged && ((Waterlogged) current.getBlockData()).isWaterlogged()) && tree.isSoil(current.getRelative(0, -1, 0).getType()) && isFlat(current)) {
-                Schematic.pasteSchematic(new Location(e.getWorld(), x, y, z), tree);
+            if (!current.getType().isSolid() && current.getType() != Material.WATER && current.getType() != Material.SEAGRASS && current.getType() != Material.TALL_SEAGRASS && !(current.getBlockData() instanceof Waterlogged && ((Waterlogged) current.getBlockData()).isWaterlogged()) && tree.isSoil(current.getRelative(0, -1, 0).getType()) && isFlat(current, chunkX, chunkZ)) {
+                Schematic.pasteSchematic(new Location(e.getWorld(), x, y, z), tree, e.getChunk());
                 break;
             }
         }
+    }
+
+    /**
+     * Rango [min, max] de desplazamientos dentro del chunk en los que puede nacer un arbol sin que
+     * el barrido de {@link #isFlat(Block, int, int)} ni la huella de la plantilla toquen un chunk
+     * vecino. Devuelve {@code null} si la plantilla no se puede leer o no cabe en un chunk.
+     */
+    private int[] getSafeTreeOffsetRange(Tree tree) {
+        int width;
+        int length;
+
+        try {
+            Schematic schematic = tree.getSchematic();
+            width = schematic.getWidth();
+            length = schematic.getLength();
+        }
+        catch (IOException | RuntimeException ex) {
+            plugin.getLogger().log(Level.WARNING, "No se pudo leer la plantilla de " + tree.getFruitID() + "_TREE, se omite la generacion en este chunk", ex);
+            return null;
+        }
+
+        return ChunkFootprint.safeOffsetRange(width, length, FLAT_SCAN_SIZE);
     }
 
     private void growBush(ChunkPopulateEvent e, int x, int z, Berry berry, Random random, boolean isPaper) {
@@ -328,9 +366,15 @@ public class PlantsListener implements Listener {
         }
     }
 
-    private boolean isFlat(Block current) {
-        for (int i = 0; i < 5; i++) {
-            for (int j = 0; j < 5; j++) {
+    private boolean isFlat(Block current, int chunkX, int chunkZ) {
+        for (int i = 0; i < FLAT_SCAN_SIZE; i++) {
+            for (int j = 0; j < FLAT_SCAN_SIZE; j++) {
+                // Guarda dura: si la columna cae fuera del chunk que se esta poblando no la
+                // leemos, porque CraftBlock.getType forzaria la carga sincrona del vecino.
+                if (!ChunkFootprint.isInsideChunk(current.getX() + i, current.getZ() + j, chunkX, chunkZ)) {
+                    return false;
+                }
+
                 for (int k = 0; k < 6; k++) {
                     if (current.getRelative(i, k, j).getType().isSolid() || Tag.LEAVES.isTagged(current.getRelative(i, k, j).getType()) || !current.getRelative(i, -1, j).getType().isSolid()) {
                         return false;
